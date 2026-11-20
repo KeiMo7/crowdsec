@@ -66,7 +66,9 @@ type DecisionsDeleteOpts struct {
 	Contains     *bool  `url:"contains,omitempty"`
 	OriginEquals string `url:"origin,omitempty"`
 	//
-	ScenarioEquals string `url:"scenario,omitempty"`
+	ScenarioEquals  string `url:"scenario,omitempty"`
+	ScenarioVersion string `url:"scenario_version,omitempty"`
+	ScenarioHash    string `url:"scenario_hash,omitempty"`
 	ListOpts
 }
 

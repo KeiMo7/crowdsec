@@ -12,7 +12,9 @@ import (
 
 	"github.com/crowdsecurity/crowdsec/pkg/csnet"
 	"github.com/crowdsecurity/crowdsec/pkg/database/ent"
+	"github.com/crowdsecurity/crowdsec/pkg/database/ent/alert"
 	"github.com/crowdsecurity/crowdsec/pkg/database/ent/decision"
+	"github.com/crowdsecurity/crowdsec/pkg/database/ent/predicate"
 )
 
 const decisionDeleteBulkSize = 2000 // bulk expire/delete batch; matches csconfig.maxDecisionBulkSize used for inserts
@@ -258,6 +260,10 @@ func (c *Client) ExpireDecisionsWithFilter(ctx context.Context, filter map[strin
 			}
 		case "scenario":
 			decisions = decisions.Where(decision.ScenarioEQ(value[0]))
+		case "scenario_version":
+			decisions = decisions.Where(decision.HasOwnerWith(alert.ScenarioVersionEQ(value[0])))
+		case "scenario_hash":
+			decisions = decisions.Where(decision.HasOwnerWith(alert.ScenarioHashEQ(value[0])))
 		default:
 			return 0, nil, fmt.Errorf("'%s' doesn't exist: %w", param, InvalidFilter)
 		}
@@ -280,6 +286,46 @@ func (c *Client) ExpireDecisionsWithFilter(ctx context.Context, filter map[strin
 	}
 
 	return count, decisionsToDelete, err
+}
+
+// ExpireDecisionsForRule expires active decisions created by one exact
+// scenario version. Expiring (rather than deleting) keeps the existing
+// decision-stream propagation path: every bouncer and peer LAPI sees the
+// removal on its next pull, and natural expiry remains the fallback if the
+// removal message is lost.
+func (c *Client) ExpireDecisionsForRule(ctx context.Context, scenario, version, hash string) (int, []*ent.Decision, error) {
+	if scenario == "" {
+		return 0, nil, fmt.Errorf("scenario is required: %w", InvalidFilter)
+	}
+	if version == "" && hash == "" {
+		return 0, nil, fmt.Errorf("scenario version or hash is required: %w", InvalidFilter)
+	}
+
+	query := c.Ent.Decision.Query().
+		Where(
+			decision.UntilGT(time.Now().UTC()),
+			decision.ScenarioEQ(scenario),
+		)
+
+	ownerPredicates := []predicate.Alert{alert.ScenarioEQ(scenario)}
+	if version != "" {
+		ownerPredicates = append(ownerPredicates, alert.ScenarioVersionEQ(version))
+	}
+	if hash != "" {
+		ownerPredicates = append(ownerPredicates, alert.ScenarioHashEQ(hash))
+	}
+	query = query.Where(decision.HasOwnerWith(ownerPredicates...))
+
+	decisionsToExpire, err := query.All(ctx)
+	if err != nil {
+		return 0, nil, fmt.Errorf("querying decisions for rule %s: %w", scenario, err)
+	}
+
+	count, err := c.ExpireDecisions(ctx, decisionsToExpire)
+	if err != nil {
+		return 0, nil, fmt.Errorf("expiring decisions for rule %s: %w", scenario, err)
+	}
+	return count, decisionsToExpire, nil
 }
 
 func decisionIDs(decisions []*ent.Decision) []int {

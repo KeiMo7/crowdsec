@@ -436,13 +436,15 @@ func (cli *cliDecisions) delete(ctx context.Context, delFilter apiclient.Decisio
 
 func (cli *cliDecisions) newDeleteCmd() *cobra.Command {
 	delFilter := apiclient.DecisionsDeleteOpts{
-		ScopeEquals:    "",
-		ValueEquals:    "",
-		TypeEquals:     "",
-		IPEquals:       "",
-		RangeEquals:    "",
-		ScenarioEquals: "",
-		OriginEquals:   "",
+		ScopeEquals:     "",
+		ValueEquals:     "",
+		TypeEquals:      "",
+		IPEquals:        "",
+		RangeEquals:     "",
+		ScenarioEquals:  "",
+		ScenarioVersion: "",
+		ScenarioHash:    "",
+		OriginEquals:    "",
 	}
 
 	var delDecisionID string
@@ -462,6 +464,7 @@ cscli decisions delete -i 1.2.3.4
 cscli decisions delete --id 42
 cscli decisions delete --type captcha
 cscli decisions delete --origin lists --scenario list_name
+cscli decisions delete --scenario crowdsecurity/http-bad-user-agent --scenario-version 0.3 --scenario-hash <hash>
 `,
 		// TBD : refaire le Long/Example
 		PreRunE: func(cmd *cobra.Command, _ []string) error {
@@ -471,9 +474,13 @@ cscli decisions delete --origin lists --scenario list_name
 			if delFilter.ScopeEquals == "" && delFilter.ValueEquals == "" &&
 				delFilter.TypeEquals == "" && delFilter.IPEquals == "" &&
 				delFilter.RangeEquals == "" && delFilter.ScenarioEquals == "" &&
+				delFilter.ScenarioVersion == "" && delFilter.ScenarioHash == "" &&
 				delFilter.OriginEquals == "" && delDecisionID == "" {
 				_ = cmd.Usage()
 				return errors.New("at least one filter or --all must be specified")
+			}
+			if (delFilter.ScenarioVersion != "" || delFilter.ScenarioHash != "") && delFilter.ScenarioEquals == "" {
+				return errors.New("--scenario-version and --scenario-hash require --scenario")
 			}
 
 			return nil
@@ -491,6 +498,8 @@ cscli decisions delete --origin lists --scenario list_name
 	flags.StringVarP(&delFilter.TypeEquals, "type", "t", "", "the decision type (ie. ban,captcha)")
 	flags.StringVarP(&delFilter.ValueEquals, "value", "v", "", "the value to match for in the specified scope")
 	flags.StringVarP(&delFilter.ScenarioEquals, "scenario", "s", "", "the scenario name (ie. crowdsecurity/ssh-bf)")
+	flags.StringVar(&delFilter.ScenarioVersion, "scenario-version", "", "only delete decisions from this exact scenario version")
+	flags.StringVar(&delFilter.ScenarioHash, "scenario-hash", "", "only delete decisions from this exact scenario hash")
 	flags.StringVar(&delFilter.OriginEquals, "origin", "", fmt.Sprintf("the value to match for the specified origin (%s ...)", strings.Join(types.GetOrigins(), ",")))
 
 	flags.StringVar(&delDecisionID, "id", "", "decision id")

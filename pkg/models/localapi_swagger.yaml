@@ -249,6 +249,16 @@ paths:
           required: false
           type: string
           description: scenario to search
+        - name: scenario_version
+          in: query
+          required: false
+          type: string
+          description: scenario version to search (requires scenario)
+        - name: scenario_hash
+          in: query
+          required: false
+          type: string
+          description: scenario content hash to search (requires scenario)
       responses:
         '200':
           description: successful operation

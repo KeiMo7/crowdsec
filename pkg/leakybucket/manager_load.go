@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/expr-lang/expr/vm"
@@ -41,15 +42,15 @@ type BucketSpec struct {
 	Labels              map[string]any             `yaml:"labels"`              // Labels is K:V list aiming at providing context the overflow
 	Blackhole           string                     `yaml:"blackhole,omitempty"` // Blackhole is a duration that, if present, will prevent same bucket partition to overflow more often than $duration
 	ScopeType           ScopeType                  `yaml:"scope,omitempty"`     // to enforce a different remediation than blocking an IP. Will default this to IP
-	Reprocess           bool                       `yaml:"reprocess"`       // Reprocess, if true, will for the bucket to be re-injected into processing chain
+	Reprocess           bool                       `yaml:"reprocess"`           // Reprocess, if true, will for the bucket to be re-injected into processing chain
 	Data                []*enrichment.DataProvider `yaml:"data,omitempty"`
-	ConditionalOverflow string                     `yaml:"condition"`       // condition if present, is an expression that must return true for the bucket to overflow
-	CacheSize           int                        `yaml:"cache_size"`      // CacheSize, if > 0, limits the size of in-memory cache of the bucket
+	ConditionalOverflow string                     `yaml:"condition"`           // condition if present, is an expression that must return true for the bucket to overflow
+	CacheSize           int                        `yaml:"cache_size"`          // CacheSize, if > 0, limits the size of in-memory cache of the bucket
 	CancelOnFilter      string                     `yaml:"cancel_on,omitempty"` // a filter that, if matched, kills the bucket
 	BayesianPrior       float32                    `yaml:"bayesian_prior"`
 	BayesianThreshold   float32                    `yaml:"bayesian_threshold"`
 	BayesianConditions  []RawBayesianCondition     `yaml:"bayesian_conditions"` // conditions for the bayesian bucket
-	OverflowFilter      string                     `yaml:"overflow_filter"` // OverflowFilter if present, is a filter that must return true for the overflow to go through
+	OverflowFilter      string                     `yaml:"overflow_filter"`     // OverflowFilter if present, is a filter that must return true for the overflow to go through
 	Duration            string                     `yaml:"duration"`            // Duration allows 'counter' buckets to have a fixed life-time
 	ScenarioVersion     string                     `yaml:"version,omitempty"`
 }
@@ -58,23 +59,30 @@ type BucketSpec struct {
 type BucketFactory struct {
 	Spec BucketSpec
 
-	logger              *log.Entry          // logger is bucket-specific logger (used by Debug as well)
-	BucketName          string
-	Filename            string
-	RunTimeFilter       *vm.Program         `json:"-"`
-	RunTimeGroupBy      *vm.Program         `json:"-"`
-	DataDir             string
-	leakspeed           time.Duration       // internal representation of `Leakspeed`
-	duration            time.Duration       // internal representation of `Duration`
-	ret                 chan pipeline.Event // the bucket-specific output chan for overflows
-	processors          []Processor         // processors is the list of hooks for pour/overflow/create (cf. uniq, blackhole etc.)
-	scenarioHash        string
-	Simulated           bool                // Set to true if the scenario instantiating the bucket was in the exclusion list
-	orderEvent          bool
+	logger         *log.Entry // logger is bucket-specific logger (used by Debug as well)
+	BucketName     string
+	Filename       string
+	RunTimeFilter  *vm.Program `json:"-"`
+	RunTimeGroupBy *vm.Program `json:"-"`
+	DataDir        string
+	leakspeed      time.Duration       // internal representation of `Leakspeed`
+	duration       time.Duration       // internal representation of `Duration`
+	ret            chan pipeline.Event // the bucket-specific output chan for overflows
+	processors     []Processor         // processors is the list of hooks for pour/overflow/create (cf. uniq, blackhole etc.)
+	scenarioHash   string
+	Simulated      bool // Set to true if the scenario instantiating the bucket was in the exclusion list
+	orderEvent     bool
 }
 
 // we use one NameGenerator for all the future buckets
 var seed = namegenerator.NewNameGenerator(time.Now().UTC().UnixNano())
+var seedMu sync.Mutex
+
+func nextName() string {
+	seedMu.Lock()
+	defer seedMu.Unlock()
+	return seed.Generate()
+}
 
 func (f *BucketFactory) Validate() error {
 	if f.Spec.Name == "" {
@@ -101,9 +109,64 @@ type SimulationChecker interface {
 	IsSimulated(scenario string) bool
 }
 
+// ScenarioSource describes a scenario file loaded outside of the hub.
+// It is used by offline replay, where scenario files must be loaded without
+// mutating the hub state used by the live agent.
+type ScenarioSource struct {
+	Name    string
+	Path    string
+	Version string
+	Hash    string
+}
+
+// LoadBucketFactoriesFromScenarios loads scenario files without going through
+// the hub. The returned factories use the same parser, processors and bucket
+// implementations as the live pipeline.
+func LoadBucketFactoriesFromScenarios(
+	scenarios []ScenarioSource,
+	dataDir string,
+	response chan pipeline.Event,
+	orderEvent bool,
+	simcheck SimulationChecker,
+) ([]BucketFactory, error) {
+	allFactories := make([]BucketFactory, 0)
+	if simcheck == nil {
+		simcheck = NoSimulation
+	}
+
+	for _, scenario := range scenarios {
+		item := &cwhub.Item{
+			Name: scenario.Name,
+			State: cwhub.ItemState{
+				LocalPath:    scenario.Path,
+				LocalVersion: scenario.Version,
+				LocalHash:    scenario.Hash,
+			},
+		}
+
+		factories, err := loadBucketFactoriesFromFile(item, dataDir, response, orderEvent, simcheck)
+		if err != nil {
+			return nil, err
+		}
+
+		allFactories = append(allFactories, factories...)
+	}
+
+	return allFactories, nil
+}
+
+type simulationCheckerFunc func(string) bool
+
+func (f simulationCheckerFunc) IsSimulated(scenario string) bool {
+	return f(scenario)
+}
+
+// NoSimulation is the default SimulationChecker for offline replay.
+var NoSimulation SimulationChecker = simulationCheckerFunc(func(_ string) bool { return false })
+
 func loadBucketFactoriesFromFile(
 	item *cwhub.Item,
-	hub *cwhub.Hub,
+	dataDir string,
 	response chan pipeline.Event,
 	orderEvent bool,
 	simcheck SimulationChecker,
@@ -138,7 +201,7 @@ func loadBucketFactoriesFromFile(
 			break
 		}
 
-		f.DataDir = hub.GetDataDir()
+		f.DataDir = dataDir
 		// check empty
 		if f.Spec.Name == "" {
 			log.Errorf("Won't load nameless bucket")
@@ -161,7 +224,7 @@ func loadBucketFactoriesFromFile(
 		}
 
 		f.Filename = filepath.Clean(itemPath)
-		f.BucketName = seed.Generate()
+		f.BucketName = nextName()
 		f.ret = response
 		f.Simulated = simcheck.IsSimulated(f.Spec.Name)
 
@@ -193,7 +256,7 @@ func LoadBuckets(
 	for _, item := range scenarios {
 		log.Debugf("Loading '%s'", item.State.LocalPath)
 
-		factories, err := loadBucketFactoriesFromFile(item, hub, response, orderEvent, &cscfg.SimulationConfig)
+		factories, err := loadBucketFactoriesFromFile(item, hub.GetDataDir(), response, orderEvent, &cscfg.SimulationConfig)
 		if err != nil {
 			return nil, nil, err
 		}

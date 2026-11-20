@@ -89,7 +89,7 @@ func NewLeakyFromFactory(f *BucketFactory) *Leaky {
 	// create the leaky bucket per se
 	l := &Leaky{
 		Limiter: limiter,
-		Uuid:    seed.Generate(),
+		Uuid:    nextName(),
 		Queue:   pipeline.NewQueue(Qsize),
 		Suicide: make(chan bool, 1),
 		AllOut:  f.ret,
