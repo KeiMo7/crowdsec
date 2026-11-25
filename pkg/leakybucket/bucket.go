@@ -54,8 +54,22 @@ type Leaky struct {
 	timedOverflow       bool
 	conditionalOverflow bool
 	logger              *log.Entry
-	mutex               *sync.Mutex // used only for TIMEMACHINE mode to allow garbage collection without races
+	mutex               *sync.Mutex // protects the mutable state below, so Health() can read it from another goroutine
 	cancel              context.CancelFunc
+}
+
+// lockState and unlockState tolerate buckets built without a factory (tests,
+// expression stubs), where the mutex is nil.
+func (l *Leaky) lockState() {
+	if l.mutex != nil {
+		l.mutex.Lock()
+	}
+}
+
+func (l *Leaky) unlockState() {
+	if l.mutex != nil {
+		l.mutex.Unlock()
+	}
 }
 
 // NewLeakyFromFactory creates a new leaky bucket from a BucketFactory
@@ -128,6 +142,12 @@ func (l *Leaky) LeakRoutine(ctx context.Context, gate pourGate) {
 
 	defer l.markDone()
 
+	if l.Factory != nil && l.Factory.orderEvent {
+		// The bucket is gone: drop its ordering gate so the map does not grow
+		// for every partition key ever seen.
+		defer orderEventDelete(l.Mapkey)
+	}
+
 	defer func() {
 		if durationTicker != nil {
 			durationTicker.Stop()
@@ -167,7 +187,7 @@ func (l *Leaky) LeakRoutine(ctx context.Context, gate pourGate) {
 				// if &msg == nil we stop processing
 				if msg == nil {
 					if l.Factory.orderEvent {
-						orderEvent[l.Mapkey].Done()
+						orderEventDone(l.Mapkey)
 					}
 					goto End
 				}
@@ -183,7 +203,7 @@ func (l *Leaky) LeakRoutine(ctx context.Context, gate pourGate) {
 				msg = processor.AfterBucketPour(l.Factory, *msg, l)
 				if msg == nil {
 					if l.Factory.orderEvent {
-						orderEvent[l.Mapkey].Done()
+						orderEventDone(l.Mapkey)
 					}
 					goto End
 				}
@@ -205,7 +225,7 @@ func (l *Leaky) LeakRoutine(ctx context.Context, gate pourGate) {
 			firstEvent = false
 			// we overflowed
 			if l.Factory.orderEvent {
-				orderEvent[l.Mapkey].Done()
+				orderEventDone(l.Mapkey)
 			}
 		// suiciiiide
 		case <-l.Suicide:
@@ -218,7 +238,9 @@ func (l *Leaky) LeakRoutine(ctx context.Context, gate pourGate) {
 			return
 		// we underflow or reach bucket deadline (timers)
 		case <-durationTickerChan:
+			l.lockState()
 			l.Ovflw_ts = time.Now().UTC()
+			l.unlockState()
 			if l.timedOverflow {
 				// a counter bucket reached its deadline: this is a real overflow,
 				// emit it through the same path as a capacity overflow.
@@ -242,8 +264,12 @@ func (l *Leaky) LeakRoutine(ctx context.Context, gate pourGate) {
 		// overflow during this iteration. Emit it now, in the same iteration that
 		// produced it and after the ordering gate was released, so no further
 		// event can be poured into the shared queue the alert is built from.
-		if l.pendingOverflow != nil {
-			l.overflow(l.pendingOverflow)
+		l.lockState()
+		pending := l.pendingOverflow
+		l.unlockState()
+
+		if pending != nil {
+			l.overflow(pending)
 			return
 		}
 	}
@@ -254,19 +280,27 @@ func Pour(l *Leaky, gate pourGate, msg pipeline.Event) {
 	end := gate.BeginPour()
 	defer end()
 
+	l.lockState()
 	l.Total_count += 1
 	if l.First_ts.IsZero() {
 		l.First_ts = time.Now().UTC()
 	}
 	l.Last_ts = time.Now().UTC()
 
+	overflowed := false
+
 	if l.Limiter.Allow() || l.conditionalOverflow {
 		l.Queue.Add(msg)
 	} else {
 		l.Ovflw_ts = time.Now().UTC()
-		l.logger.Debugf("Last event to be poured, bucket overflow.")
 		l.Queue.Add(msg)
 		l.pendingOverflow = l.Queue
+		overflowed = true
+	}
+	l.unlockState()
+
+	if overflowed {
+		l.logger.Debugf("Last event to be poured, bucket overflow.")
 	}
 }
 

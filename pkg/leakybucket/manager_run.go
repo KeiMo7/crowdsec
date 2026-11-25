@@ -32,9 +32,11 @@ func GarbageCollectBuckets(deadline time.Time, bucketStore *BucketStore) {
 
 	toflush := []string{}
 	for key, val := range snap {
+		health := val.Health()
+
 		// bucket already overflowed, we can kill it
-		if !val.Ovflw_ts.IsZero() {
-			val.logger.Debugf("overflowed at %s.", val.Ovflw_ts)
+		if !health.OverflowedAt.IsZero() {
+			val.logger.Debugf("overflowed at %s.", health.OverflowedAt)
 			toflush = append(toflush, key)
 			val.cancel()
 			continue
@@ -48,13 +50,13 @@ func GarbageCollectBuckets(deadline time.Time, bucketStore *BucketStore) {
 		// bucket actually underflowed based on log time, but no in real time
 		if tokat+eps >= tokcapa {
 			metrics.BucketsUnderflow.With(prometheus.Labels{"name": val.Factory.Spec.Name}).Inc()
-			val.logger.Debugf("UNDERFLOW : first_ts:%s tokens_at:%f capcity:%f", val.First_ts, tokat, tokcapa)
+			val.logger.Debugf("UNDERFLOW : first_ts:%s tokens_at:%f capcity:%f", health.FirstPour, tokat, tokcapa)
 			toflush = append(toflush, key)
 			val.cancel()
 			continue
 		}
 
-		val.logger.Tracef("(%s) not dead, count:%f capacity:%f", val.First_ts, tokat, tokcapa)
+		val.logger.Tracef("(%s) not dead, count:%f capacity:%f", health.FirstPour, tokat, tokcapa)
 	}
 
 	log.Infof("Cleaned %d buckets", len(toflush))
@@ -207,7 +209,94 @@ func LoadOrStoreBucketFromHolder(
 	return leaky, nil
 }
 
-var orderEvent map[string]*sync.WaitGroup
+var (
+	orderEvent     map[string]*eventGate
+	orderEventLock sync.Mutex
+)
+
+// eventGate serializes the events poured for one partition key. pending counts
+// the in-flight ones so that the map entry is only dropped once nobody waits on it.
+type eventGate struct {
+	wg      sync.WaitGroup
+	pending int
+	gone    bool
+}
+
+// orderEventAdd registers one in-flight event for mapkey, after the previous
+// one has been fully processed. Lock order is the store flow lock, then the
+// bucket mutex, then orderEventLock; never the other way around.
+func orderEventAdd(mapkey string) *eventGate {
+	orderEventLock.Lock()
+	defer orderEventLock.Unlock()
+
+	if orderEvent == nil {
+		orderEvent = make(map[string]*eventGate)
+	}
+
+	g := orderEvent[mapkey]
+	if g == nil {
+		g = &eventGate{}
+		orderEvent[mapkey] = g
+	}
+
+	g.pending++
+	g.gone = false
+	g.wg.Add(1)
+
+	return g
+}
+
+// orderEventWait waits for the pending event of mapkey to be processed.
+func orderEventWait(mapkey string) {
+	orderEventLock.Lock()
+	g := orderEvent[mapkey]
+	orderEventLock.Unlock()
+
+	if g != nil {
+		g.wg.Wait()
+	}
+}
+
+// orderEventDone releases the ordering gate held by one finished event. It is a
+// no-op when the gate is already gone, so cleanup and routine exit can race.
+func orderEventDone(mapkey string) {
+	orderEventLock.Lock()
+
+	g := orderEvent[mapkey]
+	if g == nil || g.pending <= 0 {
+		orderEventLock.Unlock()
+		return
+	}
+
+	g.pending--
+	if g.pending == 0 && g.gone {
+		delete(orderEvent, mapkey)
+	}
+
+	orderEventLock.Unlock()
+
+	g.wg.Done()
+}
+
+// orderEventDelete drops the mapkey entry once no event is in flight for it.
+// Reclaiming and the routine exit both go through here; deleting twice is a no-op.
+func orderEventDelete(mapkey string) {
+	orderEventLock.Lock()
+	defer orderEventLock.Unlock()
+
+	g := orderEvent[mapkey]
+	if g == nil {
+		return
+	}
+
+	if g.pending == 0 {
+		delete(orderEvent, mapkey)
+		return
+	}
+
+	// A pour still holds the gate: drop it when its Done arrives.
+	g.gone = true
+}
 
 func PourItemToHolders(
 	ctx context.Context,
@@ -271,22 +360,14 @@ func PourItemToHolders(
 		// finally, pour the even into the bucket
 
 		if bucket.Factory.orderEvent {
-			if orderEvent == nil {
-				orderEvent = make(map[string]*sync.WaitGroup)
-			}
-			if orderEvent[buckey] != nil {
-				orderEvent[buckey].Wait()
-			} else {
-				orderEvent[buckey] = &sync.WaitGroup{}
-			}
-
-			orderEvent[buckey].Add(1)
+			orderEventWait(buckey)
+			orderEventAdd(buckey)
 		}
 
 		err = PourItemToBucket(ctx, bucket, &holders[idx], buckets, &parsed, collector)
 
 		if bucket.Factory.orderEvent {
-			orderEvent[buckey].Wait()
+			orderEventWait(buckey)
 		}
 
 		if err != nil {

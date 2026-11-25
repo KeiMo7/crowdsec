@@ -30,15 +30,17 @@ func (*TriggerProcessor) OnBucketPour(_ *BucketFactory, msg pipeline.Event, l *L
 		l.logger.Debugf("yay timemachine overflow time: %s --> %s", d, msg.MarshaledTime)
 	}
 
+	l.lockState()
 	l.Last_ts = ts
 	l.First_ts = ts
 	l.Ovflw_ts = ts
 
 	l.Total_count = 1
-
-	l.logger.Debug("Bucket overflow")
 	l.Queue.Add(msg)
 	l.pendingOverflow = l.Queue
+	l.unlockState()
+
+	l.logger.Debug("Bucket overflow")
 
 	return nil
 }

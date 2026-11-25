@@ -61,3 +61,23 @@ var BucketsCurrentCount = prometheus.NewGaugeVec(
 	},
 	[]string{"name"},
 )
+
+const BucketsLeakedMetricName = "cs_bucket_leaked_total"
+
+var BucketsLeaked = prometheus.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: BucketsLeakedMetricName,
+		Help: "Total buckets detected as leaked, by class.",
+	},
+	[]string{"name", "class"},
+)
+
+const BucketsReclaimedMetricName = "cs_bucket_reclaimed_total"
+
+var BucketsReclaimed = prometheus.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: BucketsReclaimedMetricName,
+		Help: "Total leaked buckets reclaimed, by class.",
+	},
+	[]string{"name", "class"},
+)
